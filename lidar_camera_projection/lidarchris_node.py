@@ -21,6 +21,7 @@ import open3d as o3d
 from .utils_lidar import boxes_to_matirx
 from scipy.spatial.transform import Rotation
 import time
+import cupy as cp
 
 print(os.getcwd())
 
@@ -345,26 +346,36 @@ class Lidar2Cam(Node):
         point_cloud_msg=self.lidar_msg[lidarId]
         ptc_numpy_record = pointcloud2_to_array(point_cloud_msg)
         ptc_xyz_lidar = get_xyz_points(ptc_numpy_record)  # (N * 3 matrix)
-        mask = np.full((ptc_xyz_lidar.shape[0],), False)
+        ptc_xyz_lidar.astype(np.float32)
+        gpu_mask = cp.full((ptc_xyz_lidar.shape[0],), False)
 
         for camera_corners_lid_normed,camId in zip(camera_corners_lid_normed_list,camIdList):
             RotMat = self.RotMat[(camId,lidarId)]
             translation = self.translation[(camId,lidarId)]
             R_inv = inv(RotMat)
             trans = R_inv@translation
-            ptc_xyz_lidar_trans = ptc_xyz_lidar-trans[np.newaxis, :]
-            ptc_z_camera = ptc_xyz_lidar_trans[:, 0].reshape((-1, 1))
+            # ptc seems to be in order of z, x, y in from the code: Change the name?
+            ptc_xyz_lidar_trans = ptc_xyz_lidar_trans[np.newaxis, :] # (1 * N * 3 matrix)
+            ptc_z_camera = ptc_xyz_lidar_trans[:, 0].reshape((-1, 1)) # (N * 1 matrix)
             ptc_xyz_lidar_normed = ptc_xyz_lidar_trans[:, 1:]/ptc_z_camera
 
             # 4
             # Capture all points within the bounding box
+            bbox_filter_kernel = cp.ElementwiseKernel('float32 x, float32 y, float32 left, float32 right, float32 top, float32 bottom',
+                                                      'bool mask',
+                                                      'mask = (y >= top) & (y <= bottom) & (x >= left) & (x <= right)')
+            gpu_ptc_xyz_lidar_normed = cp.asarray(ptc_xyz_lidar_normed)
+            gpu_camera_corners_lid_normed = cp.asarray(camera_corners_lid_normed)
+            
 
             for i in range(camera_corners_lid_normed.shape[2]):  # camera_corners_lid.shape[1]): #(Columns as size)
-                mask = (mask | ((ptc_xyz_lidar_normed[:, 0] >= camera_corners_lid_normed[0, 0, i]) &  # x>=left
-                                (ptc_xyz_lidar_normed[:, 0] <= camera_corners_lid_normed[1, 0, i]) &  # x<=right
-                                (ptc_xyz_lidar_normed[:, 1] >= camera_corners_lid_normed[0, 1, i]) &  # y>=top
-                                (ptc_xyz_lidar_normed[:, 1] <= camera_corners_lid_normed[1, 1, i])))  # y<=bottom
-                # Space for Optimization here
+                
+                gpu_mask = (gpu_mask | bbox_filter_kernel(gpu_ptc_xyz_lidar_normed[:, 0], gpu_ptc_xyz_lidar_normed[:, 1],
+                                              gpu_camera_corners_lid_normed[0, 0, i], gpu_camera_corners_lid_normed[1, 0, i],
+                                              gpu_camera_corners_lid_normed[0, 1, i], gpu_camera_corners_lid_normed[1, 1, i]))
+            
+            
+        mask = cp.asnumpy(gpu_mask)
 
         ptc_xyz_lidar_filtered = ptc_xyz_lidar[mask]
         num_lidar = np.sum(mask)
